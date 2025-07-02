@@ -28,6 +28,7 @@ class SFCodeParser:
         self.html_file = html_file
         self.max_chunk_size = max_chunk_size
         self.chunks = []
+        self.chunk_number = 1  # Global chunk counter
         self.stats = {
             'rbox_elements': 0,
             'footnote_tables': 0,
@@ -106,10 +107,21 @@ class SFCodeParser:
         
         return text_content.strip()
     
-    def add_text_to_current_chunk(self, current_text, new_text, current_metadata, static_metadata):
+    def add_text_to_current_chunk(self, current_text, new_text, current_metadata, static_metadata, element=None):
         """Add text to current chunk, creating new chunk if size exceeded."""
         if not new_text:
             return current_text
+            
+        # Track HTML tag info if element provided
+        if element is not None:
+            tag_info = {
+                'tag': element.name,
+                'classes': element.get('class', []),
+                'id': element.get('id', ''),
+                'text_length': len(new_text),
+                'line_number': getattr(element, 'sourceline', None)
+            }
+            current_metadata['html_tags'].append(tag_info)
             
         # Always add a newline between elements to preserve structure
         separator = "\n" if current_text else ""
@@ -121,6 +133,11 @@ class SFCodeParser:
             if current_text:
                 self._save_chunk(current_text, current_metadata, static_metadata)
                 current_metadata['chunk_index'] += 1
+                # Reset html_tags for new chunk
+                current_metadata['html_tags'] = []
+                # Re-add current element's tag info to new chunk
+                if element is not None:
+                    current_metadata['html_tags'].append(tag_info)
             return new_text
         else:
             return combined_text
@@ -256,6 +273,7 @@ class SFCodeParser:
         metadata['hash'] = None
         metadata['chunk_index'] = 1  # Reset to 1 for new section
         metadata['div_classes'] = []  # Reset div classes for new section
+        metadata['html_tags'] = []  # Reset HTML tags for new section
         
         # Reset all fields at and below current level
         for i in range(current_level_index, len(hierarchy_tags)):
@@ -312,7 +330,8 @@ class SFCodeParser:
             'all_links': {'internal_links': [], 'external_links': [], 'intercode_links': [], 'image_links': []},
             'history_data': {'added_by': [], 'amended_by': [], 'see_also': []},
             'references': [],
-            'new_ordinance_links': []  # Links from New Ordinance Notices
+            'new_ordinance_links': [],  # Links from New Ordinance Notices
+            'html_tags': []  # Track HTML tags, text lengths, and line numbers
         }
         
         # Track unhandled text for debugging
@@ -404,6 +423,15 @@ class SFCodeParser:
                 # Start new chunk with the structural element's text
                 if text_content:
                     current_text = text_content
+                    # Track HTML tag info for structural element
+                    tag_info = {
+                        'tag': element.name,
+                        'classes': element.get('class', []),
+                        'id': element.get('id', ''),
+                        'text_length': len(text_content),
+                        'line_number': getattr(element, 'sourceline', None)
+                    }
+                    current_metadata['html_tags'].append(tag_info)
                 
                 
             # No changes needed here - text extraction happens above
@@ -429,7 +457,7 @@ class SFCodeParser:
                     
                     # Add text to current chunk
                     current_text = self.add_text_to_current_chunk(current_text, text_content, 
-                                                                   current_metadata, static_metadata)
+                                                                   current_metadata, static_metadata, element)
                     
                     # Update section_id from element id
                     if element_id:
@@ -442,7 +470,7 @@ class SFCodeParser:
                 if footnote_data:
                     footnote_text = f"\n\n[Footnote {footnote_data['marker']}] {footnote_data['text']}"
                     current_text = self.add_text_to_current_chunk(current_text, footnote_text,
-                                                                   current_metadata, static_metadata)
+                                                                   current_metadata, static_metadata, element)
             else:
                 # Include any other rbox elements with text content
                 # TODO: Add proper structural handling for:
@@ -458,7 +486,7 @@ class SFCodeParser:
                 if text_content and 'rbox' in class_name:
                     # Add text to current chunk
                     current_text = self.add_text_to_current_chunk(current_text, text_content, 
-                                                                   current_metadata, static_metadata)
+                                                                   current_metadata, static_metadata, element)
                     
                     # Extract links if this is a New Ordinance Notice
                     self.process_new_ordinance_links(element, text_content, current_metadata)
@@ -774,12 +802,14 @@ class SFCodeParser:
             'doc_id': doc_id,
             'chunk_id': f"{doc_id}_{metadata['chunk_index']}",
             'chunk_index': metadata['chunk_index'],
+            'chunk_number': self.chunk_number,
             'title': title,
             'uuid': doc_uuid,
             'processing_timestamp': datetime.now(timezone.utc).isoformat(),
             'character_count': len(text)
         }
         self.chunks.append(chunk)
+        self.chunk_number += 1
     
     
     def save_to_json(self, output_file: str):
