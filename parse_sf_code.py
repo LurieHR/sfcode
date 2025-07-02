@@ -108,7 +108,7 @@ class SFCodeParser:
         return text_content.strip()
     
     def add_text_to_current_chunk(self, current_text, new_text, current_metadata, static_metadata, element=None):
-        """Add text to current chunk, creating new chunk if size exceeded."""
+        """Add text to current chunk without size limits."""
         if not new_text:
             return current_text
             
@@ -127,20 +127,7 @@ class SFCodeParser:
         separator = "\n" if current_text else ""
             
         combined_text = current_text + separator + new_text if current_text else new_text
-            
-        if self.should_create_new_chunk(current_text, new_text):
-            # Save current chunk and start new one
-            if current_text:
-                self._save_chunk(current_text, current_metadata, static_metadata)
-                current_metadata['chunk_index'] += 1
-                # Reset html_tags for new chunk
-                current_metadata['html_tags'] = []
-                # Re-add current element's tag info to new chunk
-                if element is not None:
-                    current_metadata['html_tags'].append(tag_info)
-            return new_text
-        else:
-            return combined_text
+        return combined_text
     
     def should_create_new_chunk(self, current_text, new_text):
         """Determine if adding text would exceed chunk size."""
@@ -190,6 +177,30 @@ class SFCodeParser:
             if any(tag_keyword in cls for cls in element_classes):
                 return hier
         return None
+    
+    def current_chunk_only_contains_header(self, current_metadata, hierarchy_tags):
+        """Check if current chunk only contains header element(s)."""
+        html_tags = current_metadata.get('html_tags', [])
+        
+        if not html_tags:
+            return False
+        
+        # Check if all elements in current chunk are structural/header elements
+        for tag_info in html_tags:
+            tag_classes = tag_info.get('classes', [])
+            
+            # Check if any hierarchy tag keyword appears in the classes
+            is_structural = False
+            for hier in hierarchy_tags:
+                tag_keyword = hier['tag']
+                if any(tag_keyword in cls for cls in tag_classes):
+                    is_structural = True
+                    break
+            
+            if not is_structural:
+                return False
+        
+        return True
     
     def classify_element(self, element):
         """Classify an element by its type for processing."""
@@ -391,7 +402,17 @@ class SFCodeParser:
             # Check if this is any structural element
             structural_match = self.is_structural_element(element, hierarchy_tags)
             
-            if structural_match:
+            # Whenever we find new text, check if existing chunk is header-only - if so, always append
+            should_append_not_split = (
+                current_text and 
+                self.current_chunk_only_contains_header(current_metadata, hierarchy_tags)
+            )
+            
+            # Debug output for year-like content and ordinance tables
+            if text_content and (len(text_content.strip()) <= 10 or 'Ord. No.' in text_content[:20]):
+                print(f"DEBUG: element_id='{element_id}', structural={bool(structural_match)}, text='{text_content.strip()[:20]}...', should_append={should_append_not_split}")
+            
+            if structural_match and not should_append_not_split:
                 # Save current chunk if exists
                 if current_text:
                     # Add a newline at the end to preserve structure
@@ -433,6 +454,14 @@ class SFCodeParser:
                     }
                     current_metadata['html_tags'].append(tag_info)
                 
+            elif should_append_not_split:
+                # This "structural" element should be appended to current chunk, not start a new section
+                if text_content:
+                    current_text = self.add_text_to_current_chunk(current_text, text_content, 
+                                                                   current_metadata, static_metadata, element)
+                    # Update section_id from element id
+                    if element_id:
+                        current_metadata['section_id'] = element_id
                 
             # No changes needed here - text extraction happens above
             
@@ -455,9 +484,25 @@ class SFCodeParser:
                     # Extract and accumulate all types of links and metadata from this element
                     self.process_metadata_links(element, current_metadata)
                     
-                    # Add text to current chunk
-                    current_text = self.add_text_to_current_chunk(current_text, text_content, 
-                                                                   current_metadata, static_metadata, element)
+                    # Check if current chunk is header-only - if so, always append regardless of size
+                    is_header_only = current_text and self.current_chunk_only_contains_header(current_metadata, hierarchy_tags)
+                    if is_header_only:
+                        print(f"HEADER APPEND: Appending {len(text_content)} chars to header chunk '{current_text[:20]}...'")
+                        # Force append to header chunk regardless of size limits
+                        current_text += " " + text_content
+                        # Track HTML tag info for this element
+                        tag_info = {
+                            'tag': element.name,
+                            'classes': element.get('class', []),
+                            'id': element.get('id', ''),
+                            'text_length': len(text_content),
+                            'line_number': getattr(element, 'sourceline', None)
+                        }
+                        current_metadata['html_tags'].append(tag_info)
+                    else:
+                        # Add text to current chunk with normal size limits
+                        current_text = self.add_text_to_current_chunk(current_text, text_content, 
+                                                                       current_metadata, static_metadata, element)
                     
                     # Update section_id from element id
                     if element_id:
