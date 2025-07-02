@@ -28,6 +28,222 @@ class SFCodeParser:
         self.html_file = html_file
         self.max_chunk_size = max_chunk_size
         self.chunks = []
+        self.stats = {
+            'rbox_elements': 0,
+            'footnote_tables': 0,
+            'tables_in_rbox': 0,
+            'total_elements_processed': 0
+        }
+    
+    def extract_text_from_element(self, element):
+        """Extract text from an element, handling nested elements appropriately."""
+        text_content = ""
+        
+        # Process all nodes in the element
+        for desc in element.descendants:
+            # Handle text nodes
+            if isinstance(desc, str):
+                text = desc.strip()
+                if text:
+                    # Check parent chain to determine if we should include this text
+                    parent = desc.parent
+                    is_nested_rbox = False
+                    is_editor_note = False
+                    is_inside_annotation = False
+                    
+                    while parent and parent != element:
+                        # Skip text inside AnnotationDrawer elements
+                        if parent.name == 'annotationdrawer':
+                            is_inside_annotation = True
+                            break
+                        
+                        if hasattr(parent, 'get') and parent.get('class'):
+                            parent_classes = parent.get('class', [])
+                            if 'rbox' in parent_classes:
+                                is_nested_rbox = True
+                            if 'EdNote' in parent_classes:
+                                is_editor_note = True
+                                break
+                        parent = parent.parent
+                    
+                    # Include text if it's not in AnnotationDrawer and either not in nested rbox or is EdNote
+                    if not is_inside_annotation and (not is_nested_rbox or is_editor_note):
+                        text_content += text + " "
+            
+            # Handle various link types - their text content is already captured above,
+            # but we also want to include URLs in the text
+            elif hasattr(desc, 'name'):
+                # Check if this element is inside a nested element we should skip
+                parent = desc.parent
+                is_inside_annotation = False
+                is_nested_rbox = False
+                
+                while parent and parent != element:
+                    if parent.name == 'annotationdrawer':
+                        is_inside_annotation = True
+                        break
+                    if hasattr(parent, 'get') and parent.get('class'):
+                        parent_classes = parent.get('class', [])
+                        if 'rbox' in parent_classes and parent != element:
+                            is_nested_rbox = True
+                            break
+                    parent = parent.parent
+                
+                if not is_inside_annotation and not is_nested_rbox:
+                    # Handle img tags
+                    # Note: URLs are stored both inline (for context) and in metadata (for structured access)
+                    if desc.name == 'img':
+                        src = desc.get('src', '')
+                        if src:
+                            text_content += f"[{src}] "
+                    
+                    # Handle external links
+                    # URLs are kept inline so we know what part of text refers to the link
+                    elif desc.name == 'a' and 'Web' in desc.get('class', []):
+                        href = desc.get('href', '')
+                        if href:
+                            text_content += f"[{href}] "
+        
+        return text_content.strip()
+    
+    def add_text_to_current_chunk(self, current_text, new_text, current_metadata, static_metadata):
+        """Add text to current chunk, creating new chunk if size exceeded."""
+        if not new_text:
+            return current_text
+            
+        # Always add a newline between elements to preserve structure
+        separator = "\n" if current_text else ""
+            
+        combined_text = current_text + separator + new_text if current_text else new_text
+            
+        if self.should_create_new_chunk(current_text, new_text):
+            # Save current chunk and start new one
+            if current_text:
+                self._save_chunk(current_text, current_metadata, static_metadata)
+                current_metadata['chunk_index'] += 1
+            return new_text
+        else:
+            return combined_text
+    
+    def should_create_new_chunk(self, current_text, new_text):
+        """Determine if adding text would exceed chunk size."""
+        return len(current_text + new_text) > self.max_chunk_size
+    
+    def extract_inner_div_classes(self, element):
+        """Extract semantic class information from inner divs."""
+        inner_div = element.find('div', recursive=False)
+        if inner_div and inner_div.find('annotationdrawer'):
+            # Skip AnnotationDrawer and get the actual content div
+            content_divs = element.find_all('div', recursive=False)
+            if len(content_divs) > 1:
+                inner_div = content_divs[1]
+        
+        div_classes = []
+        if inner_div and inner_div.get('class'):
+            div_class = ' '.join(inner_div.get('class', []))
+            if div_class:
+                div_classes.append(div_class)
+        
+        return div_classes
+    
+    def process_metadata_links(self, element, current_metadata):
+        """Extract all links and history from element and update metadata."""
+        # Extract all types of links
+        all_links = self.div_links_extract_all(element)
+        
+        # Update link metadata
+        current_metadata['all_links']['internal_links'].extend(all_links['internal_links'])
+        current_metadata['all_links']['external_links'].extend(all_links['external_links'])
+        current_metadata['all_links']['intercode_links'].extend(all_links['intercode_links'])
+        current_metadata['all_links']['image_links'].extend(all_links.get('image_links', []))
+        
+        # Process internal links to extract references
+        self._process_internal_links(all_links['internal_links'], current_metadata)
+        
+        # Extract and store history data if present
+        history_data = self.div_history_extract(element)
+        if any(history_data[key] for key in history_data):
+            current_metadata['history_data'] = history_data
+    
+    def is_structural_element(self, element, hierarchy_tags):
+        """Check if element matches any structural pattern (Chapter, Article, etc.)."""
+        element_classes = element.get('class', [])
+        for hier in hierarchy_tags:
+            tag_keyword = hier['tag']
+            if any(tag_keyword in cls for cls in element_classes):
+                return hier
+        return None
+    
+    def classify_element(self, element):
+        """Classify an element by its type for processing."""
+        if element.name == 'annotationdrawer':
+            return 'skip'
+        
+        if element.name == 'div' and element.get('class'):
+            classes = element.get('class', [])
+            class_str = ' '.join(classes)
+            
+            # Check for structural elements
+            if 'rbox' in classes:
+                if any(keyword in class_str for keyword in ['Chapter', 'Article', 'Division', 'Section', 'Subsection']):
+                    return 'structural'
+                elif 'Normal-Level' in classes:
+                    return 'content'
+                else:
+                    return 'other_rbox'
+            
+            # Non-rbox divs
+            if 'EdNote' in classes:
+                return 'editor_note'
+            if 'History' in classes:
+                return 'history'
+            if 'clearfix' in classes:
+                return 'skip'
+        
+        elif element.name == 'table' and 'footnote' in element.get('class', []):
+            return 'footnote'
+        
+        elif element.name in ['script', 'style']:
+            return 'skip'
+        
+        # Skip inline elements - their text will be captured by parent elements
+        elif element.name in ['span', 'a', 'b', 'i', 'strong', 'em', 'br', 'sup', 'sub', 'font', 'intercodelink', 'link']:
+            return 'skip'
+        
+        # Only process block-level elements with text
+        elif element.name in ['p', 'td', 'th', 'li', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6']:
+            text = element.get_text(strip=True)
+            if text:
+                return 'other_content'
+        
+        return 'skip'
+    
+    def process_new_ordinance_links(self, element, text_content, current_metadata):
+        """Extract links from New Ordinance Notice elements."""
+        class_name = ' '.join(element.get('class', []))
+        if 'NewOrd' in class_name or 'new ordinance' in text_content.lower():
+            all_links = self.div_links_extract_all(element)
+            # Add new ordinance related links to metadata
+            for link in all_links['internal_links']:
+                if 'NewOrd' in link or 'new' in link.lower():
+                    current_metadata['new_ordinance_links'].append(link)
+            current_metadata['all_links']['internal_links'].extend(all_links['internal_links'])
+            current_metadata['all_links']['external_links'].extend(all_links['external_links'])
+    
+    def process_footnote(self, footnote_element):
+        """Extract text from a footnote table element."""
+        marker_cell = footnote_element.find('td', class_='marker')
+        text_cell = footnote_element.find('td', class_='foot-text')
+        
+        if marker_cell and text_cell:
+            marker = marker_cell.get_text(strip=True)
+            text = text_cell.get_text(strip=True)
+            return {
+                'marker': marker,
+                'text': text,
+                'type': 'footnote'
+            }
+        return None
         
     def _reset_metadata_for_new_section(self, metadata: Dict[str, Any], hierarchy_tags: List[Dict], 
                                         current_level_index: int) -> None:
@@ -36,6 +252,7 @@ class SFCodeParser:
         metadata['all_links'] = {'internal_links': [], 'external_links': [], 'intercode_links': [], 'image_links': []}
         metadata['history_data'] = {'added_by': [], 'amended_by': [], 'see_also': []}
         metadata['references'] = []
+        metadata['new_ordinance_links'] = []
         metadata['hash'] = None
         metadata['chunk_index'] = 1  # Reset to 1 for new section
         metadata['div_classes'] = []  # Reset div classes for new section
@@ -45,135 +262,32 @@ class SFCodeParser:
             for field in hierarchy_tags[i]['fields']:
                 metadata[field] = None
     
-    def parse_text_only_no_metadata(self) -> List[Dict[str, Any]]:
-        """Parse HTML file extracting only text content without links, images, or other metadata."""
-        
-        try:
-            with open(self.html_file, 'r', encoding='utf-8') as f:
-                soup = BeautifulSoup(f.read(), 'html.parser')
-        except FileNotFoundError:
-            print(f"Error: File '{self.html_file}' not found")
-            return []
-        except Exception as e:
-            print(f"Error reading file '{self.html_file}': {e}")
-            return []
-        
-        # Static metadata
-        static_metadata = {
-            'source_url': 'https://codelibrary.amlegal.com/codes/san_francisco/latest/overview',
-            'download_date': '2024-06-30',
-            'city': 'San Francisco'
-        }
-        
-        current_text = ""
-        current_metadata = {
-            'chapter': None,
-            'article': None, 
-            'article_number': None,
-            'article_title': None,
-            'division': None,
-            'section': None,
-            'section_number': None,
-            'section_id': None,
-            'subsection': None,
-            'chunk_index': 1,
-            'div_classes': [],
-            'all_links': {'internal_links': [], 'external_links': [], 'intercode_links': [], 'image_links': []},
-            'history_data': {'added_by': [], 'amended_by': [], 'see_also': []},
-            'references': []
-        }
-        
-        # Define structural boundaries that trigger new chunks
-        # Each tuple contains the required classes for that structural type
-        structural_patterns = {
-            ('rbox', 'Chapter'): 'chapter',
-            ('rbox', 'Article'): 'article',
-            ('rbox', 'Division'): 'division',
-            ('Section', 'toc-destination'): 'section',
-            ('Subsection', 'toc-destination'): 'subsection'
-        }
-        
-        # Process elements but only extract their direct text (like browser rendering)
-        for element in soup.descendants:
-            # We want NavigableString objects (text nodes) only
-            if not isinstance(element, str):
-                continue
-                
-            # Skip whitespace-only text
-            text = element.strip()
-            if not text:
-                continue
-                
-            # Skip text inside script/style tags
-            parent = element.parent
-            if parent.name in ['script', 'style']:
-                continue
-                
-            # Get the closest parent element with meaningful structure
-            structural_parent = parent
-            while structural_parent and not structural_parent.get('class'):
-                structural_parent = structural_parent.parent
-                if not structural_parent or structural_parent.name == 'html':
-                    break
-                    
-            # Check if this is a structural boundary
-            element_classes = set(structural_parent.get('class', [])) if structural_parent and hasattr(structural_parent, 'get') else set()
-            structural_type = None
-            
-            for required_classes, field_name in structural_patterns.items():
-                if all(cls in element_classes for cls in required_classes):
-                    structural_type = field_name
-                    break
-            
-            if structural_type:
-                # Save current chunk if it has content
-                if current_text:
-                    self._save_chunk(current_text, current_metadata, static_metadata)
-                    current_text = ""
-                    current_metadata['chunk_index'] = 1  # Reset to 1 for new section
-                    current_metadata['div_classes'] = []  # Reset div classes for new section
-                
-                # Update metadata
-                current_metadata[structural_type] = text
-                
-                # TODO: Extract additional metadata (section numbers, article titles, etc.)
-                # TODO: Implement hierarchical reset based on level
-                
-                # Start new chunk with structural text
-                current_text = text
-            else:
-                # Not structural, add to current chunk
-                if current_text:
-                    current_text += "\n\n" + text
-                else:
-                    current_text = text
-                    
-                # Track div classes if present (from the structural parent)
-                if element_classes:
-                    div_class = ' '.join(sorted(element_classes))  # Sort for consistency
-                    if div_class not in current_metadata['div_classes']:
-                        current_metadata['div_classes'].append(div_class)
-                        
-                # Check for ID that might be section_id (from the parent element)
-                if parent and hasattr(parent, 'get') and parent.get('id'):
-                    current_metadata['section_id'] = parent.get('id')
-        
-        # Save final chunk
-        if current_text:
-            self._save_chunk(current_text, current_metadata, static_metadata)
-            
-        print(f"Created {len(self.chunks)} chunks")
-        return self.chunks
     
     def parse(self) -> List[Dict[str, Any]]:
         """Parse the HTML file and return chunked data with metadata."""
         
+        import time
+        parse_start_time = time.time()
+        print(f"Parse started at time {parse_start_time}")
+        
         with open(self.html_file, 'r', encoding='utf-8') as f:
             soup = BeautifulSoup(f.read(), 'html.parser')
         
-        # Find all rbox elements that contain structural information
-        elements = soup.find_all('div', class_=re.compile(r'rbox'))
-        print(f"Found {len(elements)} rbox elements")
+        # Function to identify elements we want to process
+        def has_target_class(tag):
+            if tag.name == 'div':
+                classes = tag.get('class', [])
+                return any('rbox' in c for c in classes)
+            elif tag.name == 'table':
+                classes = tag.get('class', [])
+                return 'footnote' in classes
+            # Note: Footnote marker spans are already captured inside rbox text
+            # Note: Only 14 <p> tags exist in the document, mostly empty
+            return False
+        
+        # Find all rbox divs and footnote tables in document order
+        elements = soup.find_all(has_target_class)
+        print(f"Found {len(elements)} elements (rbox divs + footnote tables + standalone p/span)")
         
         # Hard-coded metadata fields
         static_metadata = {
@@ -197,34 +311,38 @@ class SFCodeParser:
             'div_classes': [],  # Track CSS classes of content divs in this chunk
             'all_links': {'internal_links': [], 'external_links': [], 'intercode_links': [], 'image_links': []},
             'history_data': {'added_by': [], 'amended_by': [], 'see_also': []},
-            'references': []
+            'references': [],
+            'new_ordinance_links': []  # Links from New Ordinance Notices
         }
+        
+        # Track unhandled text for debugging
+        unhandled_text = []
         
         # Define hierarchy tags with extraction rules
         hierarchy_tags = [
             {
-                'tag': 'rbox Chapter', 
+                'tag': 'Chapter', 
                 'type': 'Chapter', 
                 'fields': ['chapter'],
                 'extractors': {}
             },
             {
-                'tag': 'rbox Article', 
+                'tag': 'Article', 
                 'type': 'Article', 
                 'fields': ['article', 'article_number', 'article_title'],
                 'extractors': {
-                    'article_number': r'^(\d+[A-Z]?-?\d*\.?|\b[IVXLCDM]+\b)\.?\s+(.+)',
-                    'article_title': lambda match: match.group(2) if match else None
+                    'article_number': r'^(ARTICLE\s+)?(\d+[A-Z]?-?\d*\.?|\b[IVXLCDM]+\b)[:.]?\s+(.+)',
+                    'article_title': lambda match: match.group(3) if match else None
                 }
             },
             {
-                'tag': 'rbox Division', 
+                'tag': 'Division', 
                 'type': 'Division', 
                 'fields': ['division'],
                 'extractors': {}
             },
             {
-                'tag': 'Section toc-destination', 
+                'tag': 'Section', 
                 'type': 'Section', 
                 'fields': ['section_title', 'section_number'],
                 'extractors': {
@@ -232,7 +350,7 @@ class SFCodeParser:
                 }
             },
             {
-                'tag': 'Subsection toc-destination', 
+                'tag': 'Subsection', 
                 'type': 'Subsection', 
                 'fields': ['subsection'],
                 'extractors': {}
@@ -242,53 +360,24 @@ class SFCodeParser:
         for i, element in enumerate(elements):
             if i % 100 == 0:
                 print(f"Processing element {i}/{len(elements)}")
+            
+            self.stats['total_elements_processed'] += 1
                 
             class_name = ' '.join(element.get('class', []))
             element_id = element.get('id', '')
             
-            # Skip AnnotationDrawer and get content div
-            content_div = element
-            annotation_drawer = element.find('AnnotationDrawer')
-            if annotation_drawer:
-                # Get the div after AnnotationDrawer
-                content_divs = element.find_all('div', recursive=False)
-                if len(content_divs) > 1:
-                    content_div = content_divs[1]
-                elif len(content_divs) == 1:
-                    content_div = content_divs[0]
-            
-            # Extract text from the content div, avoiding nested rbox elements
-            text_content = ""
-            if content_div != element or not annotation_drawer:
-                # Process all descendants but skip nested rbox elements
-                for desc in content_div.descendants:
-                    if isinstance(desc, str):
-                        text = desc.strip()
-                        if text:
-                            # Check if this text is inside a nested rbox
-                            parent = desc.parent
-                            is_nested_rbox = False
-                            while parent and parent != content_div:
-                                if hasattr(parent, 'get') and parent.get('class'):
-                                    if 'rbox' in parent.get('class', []):
-                                        is_nested_rbox = True
-                                        break
-                                parent = parent.parent
-                            
-                            if not is_nested_rbox:
-                                text_content += text + " "
-            text_content = text_content.strip()
+            # Extract text from element
+            text_content = self.extract_text_from_element(element)
             
             # Check if this is any structural element
-            structural_match = None
-            for hier in hierarchy_tags:
-                if hier['tag'] in class_name:
-                    structural_match = hier
-                    break
+            structural_match = self.is_structural_element(element, hierarchy_tags)
             
             if structural_match:
                 # Save current chunk if exists
                 if current_text:
+                    # Add a newline at the end to preserve structure
+                    if not current_text.endswith('\n'):
+                        current_text += '\n'
                     self._save_chunk(current_text, current_metadata, static_metadata)
                     current_text = ""
                 
@@ -336,42 +425,79 @@ class SFCodeParser:
                             current_metadata['div_classes'].append(div_class)
                     
                     # Extract and accumulate all types of links and metadata from this element
-                    all_links = self.div_links_extract_all(element)
-                    history_data = self.div_history_extract(element)
+                    self.process_metadata_links(element, current_metadata)
                     
-                    # Store raw internal links
-                    current_metadata['all_links']['internal_links'].extend(all_links['internal_links'])
-                    current_metadata['all_links']['external_links'].extend(all_links['external_links']) 
-                    current_metadata['all_links']['intercode_links'].extend(all_links['intercode_links'])
-                    current_metadata['all_links']['image_links'].extend(all_links.get('image_links', []))
-                    
-                    # Parse internal links to extract reference information
-                    self._process_internal_links(all_links['internal_links'], current_metadata)
-                    
-                    # Store history data only if present in this specific div
-                    # This keeps history contextually relevant to where it appears
-                    if any(history_data[key] for key in history_data):
-                        current_metadata['history_data'] = history_data
-                    
-                    # Check if adding this would exceed chunk size
-                    if len(current_text + text_content) > self.max_chunk_size:
-                        # Save current chunk and start new one
-                        if current_text:
-                            self._save_chunk(current_text, current_metadata, static_metadata)
-                            current_metadata['chunk_index'] += 1  # Increment for next chunk
-                        current_text = text_content
-                    else:
-                        current_text += "\n\n" + text_content if current_text else text_content
+                    # Add text to current chunk
+                    current_text = self.add_text_to_current_chunk(current_text, text_content, 
+                                                                   current_metadata, static_metadata)
                     
                     # Update section_id from element id
                     if element_id:
                         current_metadata['section_id'] = element_id
+            elif element.name == 'table' and 'footnote' in class_name:
+                # Handle footnote tables
+                self.stats['footnote_tables'] += 1
+                print(f"  Found footnote table with marker")
+                footnote_data = self.process_footnote(element)
+                if footnote_data:
+                    footnote_text = f"\n\n[Footnote {footnote_data['marker']}] {footnote_data['text']}"
+                    current_text = self.add_text_to_current_chunk(current_text, footnote_text,
+                                                                   current_metadata, static_metadata)
+            else:
+                # Include any other rbox elements with text content
+                # TODO: Add proper structural handling for:
+                # - Subdivision (33 items) -> metadata['subdivision']
+                # - Subarticle (29 items) -> metadata['subarticle'] 
+                # - Parts (25 items) -> metadata['part']
+                # - SubArt (19 items) -> metadata['subart']
+                # - Title-Subchapter (16 items) -> metadata['title_subchapter']
+                # - SubSecGroup (12 items) -> metadata['subsection_group']
+                # - Year markers (15 items) -> metadata['year']
+                # - etc.
+                # For now, we just capture their text content
+                if text_content and 'rbox' in class_name:
+                    # Add text to current chunk
+                    current_text = self.add_text_to_current_chunk(current_text, text_content, 
+                                                                   current_metadata, static_metadata)
+                    
+                    # Extract links if this is a New Ordinance Notice
+                    self.process_new_ordinance_links(element, text_content, current_metadata)
+                    
+                    # Track for debugging (optional - can remove later)
+                    unhandled_text.append({
+                        'class': class_name,
+                        'text': text_content[:200] + '...' if len(text_content) > 200 else text_content,
+                        'full_length': len(text_content),
+                        'status': 'included'
+                    })
         
         # Save final chunk
         if current_text:
             self._save_chunk(current_text, current_metadata, static_metadata)
             
-        print(f"Created {len(self.chunks)} chunks")
+        import time
+        print(f"Line 594 created {len(self.chunks)} chunks at time {time.time()}")
+        print(f"\nParser Statistics:")
+        print(f"  Total elements processed: {self.stats['total_elements_processed']}")
+        print(f"  Footnote tables found: {self.stats['footnote_tables']}")
+        print(f"  Tables are captured within rbox element content")
+        
+        # Save unhandled text for analysis
+        if unhandled_text:
+            print(f"\nFound {len(unhandled_text)} unhandled rbox elements with text")
+            with open('unhandled_text.json', 'w') as f:
+                json.dump(unhandled_text, f, indent=2)
+            print("Saved to unhandled_text.json")
+            
+            # Show summary by class
+            class_counts = {}
+            for item in unhandled_text:
+                class_counts[item['class']] = class_counts.get(item['class'], 0) + 1
+            
+            print("\nUnhandled text by class:")
+            for cls, count in sorted(class_counts.items(), key=lambda x: x[1], reverse=True):
+                print(f"  {cls}: {count} items")
+        
         return self.chunks
     
     def _process_internal_links(self, internal_links: List[str], metadata: Dict[str, Any]) -> None:
@@ -448,7 +574,11 @@ class SFCodeParser:
                         if field == 'section_number':
                             data[field] = match.group(1)
                         elif field == 'article_number':
-                            data[field] = match.group(1)
+                            # Regex groups for article pattern:
+                            # Group 1: Optional "ARTICLE " prefix (or None)
+                            # Group 2: The article number (XII, 2A, III, etc.)
+                            # Group 3: The article title
+                            data[field] = match.group(2)
                             # Check if there's a title extractor
                             if 'article_title' in hier_config['extractors']:
                                 title_extractor = hier_config['extractors']['article_title']
@@ -605,6 +735,7 @@ class SFCodeParser:
     
     def _save_chunk(self, text: str, metadata: Dict[str, Any], static_metadata: Dict[str, str]):
         """Save a chunk with its metadata in the standard document format."""
+        import time
         # Create hierarchical title
         title_parts = []
         if metadata['chapter']:
