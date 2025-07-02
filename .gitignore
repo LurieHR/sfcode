@@ -1,0 +1,17 @@
+# Large files over 100MB (keep locally, don't push to GitHub)
+rawcodes/san_francisco-ca-complete.html
+sf_code_chunks.json
+
+# Keep these smaller files:
+# rawcodes/san_francisco-ca-unstructuredtext.txt (31MB - OK for GitHub)
+
+# Python
+*.pyc
+__pycache__/
+
+# OS files
+.DS_Store
+
+# Temporary files
+reconstructed_raw.txt
+diff_output.txt
