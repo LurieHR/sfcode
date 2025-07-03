@@ -14,7 +14,6 @@ import argparse
 # Configuration
 CONFIG = {
     'input_file': 'rawcodes/san_francisco-ca-complete.html',
-    'output_file': 'sf_code_chunks.json',
     'max_chunk_size': 2000,
     'congressionalrag_path': '/Users/helen/hack/git/congressionalrag'
 }
@@ -107,6 +106,81 @@ class SFCodeParser:
         
         return text_content.strip()
     
+    def add_or_split_text(self, current_text, new_text, current_metadata, static_metadata, element, hierarchy_tags):
+        """Single place for all text addition/splitting decisions"""
+        if not new_text:
+            return current_text
+            
+        # Track HTML tag info for this element
+        tag_info = {
+            'tag': element.name,
+            'classes': element.get('class', []),
+            'id': element.get('id', ''),
+            'text_length': len(new_text),
+            'line_number': getattr(element, 'sourceline', None)
+        }
+        
+        # Decision 1: If current chunk is header-only, always append
+        if current_text and self.current_chunk_only_contains_header(current_text, current_metadata, hierarchy_tags):
+            current_metadata['html_tags'].append(tag_info)
+            separator = "\n" if current_text else ""
+            return current_text + separator + new_text
+        
+        # Decision 2: If incoming element moves UP the hierarchy, create new chunk
+        structural_match = self.is_structural_element(element, hierarchy_tags)
+        if structural_match:
+            # Check if this moves up the hierarchy from current state
+            should_split = False
+            current_level_index = len(hierarchy_tags)  # Default to lowest level
+            
+            # Find the current highest level set in metadata
+            for i, hier in enumerate(hierarchy_tags):
+                for field in hier['fields']:
+                    if current_metadata.get(field):
+                        current_level_index = min(current_level_index, i)
+                        break
+            
+            # Get the level of the incoming structural element
+            incoming_level_index = hierarchy_tags.index(structural_match)
+            
+            # Only split if we're moving to a higher level (lower index) or if no level is set yet
+            if incoming_level_index < current_level_index or current_level_index == len(hierarchy_tags):
+                should_split = True
+            
+            if should_split and current_text:
+                self._save_chunk(current_text, current_metadata, static_metadata)
+                current_metadata['chunk_index'] += 1
+                # Reset metadata for new chunk
+                self._reset_metadata_for_new_section(current_metadata, hierarchy_tags, incoming_level_index)
+                # Start new chunk with this element's text
+                current_metadata['html_tags'].append(tag_info)
+                return new_text
+            else:
+                # Not splitting - append to current chunk
+                current_metadata['html_tags'].append(tag_info)
+                separator = "\n" if current_text else ""
+                return current_text + separator + new_text
+        
+        # Decision 3: If adding would exceed max size, create new chunk
+        if len(current_text + new_text) > self.max_chunk_size:
+            if current_text:
+                self._save_chunk(current_text, current_metadata, static_metadata)
+                current_metadata['chunk_index'] += 1
+                # Reset ALL accumulating metadata fields for new chunk
+                current_metadata['all_links'] = {'internal_links': [], 'external_links': [], 'intercode_links': [], 'image_links': []}
+                current_metadata['history_data'] = {'added_by': [], 'amended_by': [], 'see_also': []}
+                current_metadata['references'] = []
+                current_metadata['new_ordinance_links'] = []
+                current_metadata['div_classes'] = []
+                current_metadata['html_tags'] = []
+            current_metadata['html_tags'].append(tag_info)
+            return new_text
+        
+        # Decision 4: Just append to current chunk
+        current_metadata['html_tags'].append(tag_info)
+        separator = "\n" if current_text else ""
+        return current_text + separator + new_text if current_text else new_text
+
     def add_text_to_current_chunk(self, current_text, new_text, current_metadata, static_metadata, element=None):
         """Add text to current chunk without size limits."""
         if not new_text:
@@ -178,29 +252,59 @@ class SFCodeParser:
                 return hier
         return None
     
-    def current_chunk_only_contains_header(self, current_metadata, hierarchy_tags):
-        """Check if current chunk only contains header element(s)."""
+    def current_chunk_only_contains_header(self, current_text, current_metadata, hierarchy_tags):
+        """Check if current chunk only contains header element(s) or minimal content."""
         html_tags = current_metadata.get('html_tags', [])
         
         if not html_tags:
             return False
         
-        # Check if all elements in current chunk are structural/header elements
+        # List of content patterns that should be treated as headers
+        header_patterns = ['AMENDMENT HISTORY']
+        
+        total_content_length = sum(tag.get('text_length', 0) for tag in html_tags)
+        
+        # Check if chunk is short and matches header patterns
+        if total_content_length < 100:
+            current_text_clean = current_text.strip().upper()
+            if current_text_clean in header_patterns:
+                return True
+            
+            # Check for chapter/appendix patterns with matching HTML tags
+            has_chapter_tag = any('Chapter' in str(tag.get('classes', [])) for tag in html_tags)
+            if has_chapter_tag and (current_text_clean.startswith('CHAPTER ') or current_text_clean.startswith('APPENDIX ')):
+                return True
+            
+            # Check for year ordinance patterns
+            has_year_tag = any('level-Year' in str(tag.get('classes', [])) for tag in html_tags)
+            if has_year_tag and 'ORDINANCES' in current_text_clean:
+                return True
+        
+        has_structural = False
+        non_structural_length = 0
+        
+        # Check each element in current chunk
         for tag_info in html_tags:
             tag_classes = tag_info.get('classes', [])
+            text_length = tag_info.get('text_length', 0)
             
-            # Check if any hierarchy tag keyword appears in the classes
+            # Check if this element is structural/header
             is_structural = False
             for hier in hierarchy_tags:
                 tag_keyword = hier['tag']
                 if any(tag_keyword in cls for cls in tag_classes):
                     is_structural = True
+                    has_structural = True
                     break
             
+            # If not structural, add to content length
             if not is_structural:
-                return False
+                non_structural_length += text_length
         
-        return True
+        # Consider header-only if:
+        # 1. Has structural elements AND chunk is short overall (header without much content)
+        # 2. OR matches specific header patterns  
+        return has_structural and total_content_length < 100
     
     def classify_element(self, element):
         """Classify an element by its type for processing."""
@@ -402,136 +506,49 @@ class SFCodeParser:
             # Check if this is any structural element
             structural_match = self.is_structural_element(element, hierarchy_tags)
             
-            # Whenever we find new text, check if existing chunk is header-only - if so, always append
-            should_append_not_split = (
-                current_text and 
-                self.current_chunk_only_contains_header(current_metadata, hierarchy_tags)
-            )
-            
-            # Debug output for year-like content and ordinance tables
-            if text_content and (len(text_content.strip()) <= 10 or 'Ord. No.' in text_content[:20]):
-                print(f"DEBUG: element_id='{element_id}', structural={bool(structural_match)}, text='{text_content.strip()[:20]}...', should_append={should_append_not_split}")
-            
-            if structural_match and not should_append_not_split:
-                # Save current chunk if exists
-                if current_text:
-                    # Add a newline at the end to preserve structure
-                    if not current_text.endswith('\n'):
-                        current_text += '\n'
-                    self._save_chunk(current_text, current_metadata, static_metadata)
-                    current_text = ""
-                
-                # Find current level index
-                current_level_index = hierarchy_tags.index(structural_match)
-                
-                # Reset metadata using helper function
-                self._reset_metadata_for_new_section(current_metadata, hierarchy_tags, current_level_index)
-                
-                # Extract element text (already extracted as text_content above)
-                element_text = text_content
-                
+            # Process element metadata based on type
+            if structural_match:
                 # Extract data using the configuration
                 extracted_data = self._extract_structural_data(element, structural_match)
-                
                 # Update current metadata with extracted data
                 current_metadata.update(extracted_data)
-                
                 # Set hash based on the anchor found using data-driven approach
                 anchor_field = f"{structural_match['type'].lower()}_anchor"
                 if anchor_field in extracted_data:
                     current_metadata['hash'] = f"#{extracted_data[anchor_field]}"
-                
-                # Start new chunk with the structural element's text
-                if text_content:
-                    current_text = text_content
-                    # Track HTML tag info for structural element
-                    tag_info = {
-                        'tag': element.name,
-                        'classes': element.get('class', []),
-                        'id': element.get('id', ''),
-                        'text_length': len(text_content),
-                        'line_number': getattr(element, 'sourceline', None)
-                    }
-                    current_metadata['html_tags'].append(tag_info)
-                
-            elif should_append_not_split:
-                # This "structural" element should be appended to current chunk, not start a new section
-                if text_content:
-                    current_text = self.add_text_to_current_chunk(current_text, text_content, 
-                                                                   current_metadata, static_metadata, element)
-                    # Update section_id from element id
-                    if element_id:
-                        current_metadata['section_id'] = element_id
-                
-            # No changes needed here - text extraction happens above
-            
+                    
             elif 'Normal-Level' in class_name:
-                # This is content - add to current chunk
-                if text_content:
-                    # Extract the inner div's class for semantic information
-                    inner_div = element.find('div', recursive=False)
-                    if inner_div and inner_div.find('annotationdrawer'):
-                        # Skip AnnotationDrawer and get the actual content div
-                        content_divs = element.find_all('div', recursive=False)
-                        if len(content_divs) > 1:
-                            inner_div = content_divs[1]
-                    
-                    if inner_div and inner_div.get('class'):
-                        div_class = ' '.join(inner_div.get('class', []))
-                        if div_class and div_class not in current_metadata['div_classes']:
-                            current_metadata['div_classes'].append(div_class)
-                    
-                    # Extract and accumulate all types of links and metadata from this element
-                    self.process_metadata_links(element, current_metadata)
-                    
-                    # Check if current chunk is header-only - if so, always append regardless of size
-                    is_header_only = current_text and self.current_chunk_only_contains_header(current_metadata, hierarchy_tags)
-                    if is_header_only:
-                        print(f"HEADER APPEND: Appending {len(text_content)} chars to header chunk '{current_text[:20]}...'")
-                        # Force append to header chunk regardless of size limits
-                        current_text += " " + text_content
-                        # Track HTML tag info for this element
-                        tag_info = {
-                            'tag': element.name,
-                            'classes': element.get('class', []),
-                            'id': element.get('id', ''),
-                            'text_length': len(text_content),
-                            'line_number': getattr(element, 'sourceline', None)
-                        }
-                        current_metadata['html_tags'].append(tag_info)
-                    else:
-                        # Add text to current chunk with normal size limits
-                        current_text = self.add_text_to_current_chunk(current_text, text_content, 
-                                                                       current_metadata, static_metadata, element)
-                    
-                    # Update section_id from element id
-                    if element_id:
-                        current_metadata['section_id'] = element_id
+                # Extract the inner div's class for semantic information
+                inner_div = element.find('div', recursive=False)
+                if inner_div and inner_div.find('annotationdrawer'):
+                    # Skip AnnotationDrawer and get the actual content div
+                    content_divs = element.find_all('div', recursive=False)
+                    if len(content_divs) > 1:
+                        inner_div = content_divs[1]
+                
+                if inner_div and inner_div.get('class'):
+                    div_class = ' '.join(inner_div.get('class', []))
+                    if div_class and div_class not in current_metadata['div_classes']:
+                        current_metadata['div_classes'].append(div_class)
+                
+                # Extract and accumulate all types of links and metadata from this element
+                self.process_metadata_links(element, current_metadata)
+                
             elif element.name == 'table' and 'footnote' in class_name:
                 # Handle footnote tables
                 self.stats['footnote_tables'] += 1
                 print(f"  Found footnote table with marker")
                 footnote_data = self.process_footnote(element)
                 if footnote_data:
-                    footnote_text = f"\n\n[Footnote {footnote_data['marker']}] {footnote_data['text']}"
-                    current_text = self.add_text_to_current_chunk(current_text, footnote_text,
-                                                                   current_metadata, static_metadata, element)
-            else:
-                # Include any other rbox elements with text content
-                # TODO: Add proper structural handling for:
-                # - Subdivision (33 items) -> metadata['subdivision']
-                # - Subarticle (29 items) -> metadata['subarticle'] 
-                # - Parts (25 items) -> metadata['part']
-                # - SubArt (19 items) -> metadata['subart']
-                # - Title-Subchapter (16 items) -> metadata['title_subchapter']
-                # - SubSecGroup (12 items) -> metadata['subsection_group']
-                # - Year markers (15 items) -> metadata['year']
-                # - etc.
-                # For now, we just capture their text content
-                if text_content and 'rbox' in class_name:
-                    # Add text to current chunk
-                    current_text = self.add_text_to_current_chunk(current_text, text_content, 
-                                                                   current_metadata, static_metadata, element)
+                    text_content = f"\n\n[Footnote {footnote_data['marker']}] {footnote_data['text']}"
+            
+            # Single decision point for all text addition/splitting
+            if text_content:
+                current_text = self.add_or_split_text(current_text, text_content, current_metadata, static_metadata, element, hierarchy_tags)
+                
+                # Update section_id from element id if applicable
+                if element_id:
+                    current_metadata['section_id'] = element_id
                     
                     # Extract links if this is a New Ordinance Notice
                     self.process_new_ordinance_links(element, text_content, current_metadata)
@@ -867,8 +884,8 @@ def main():
     parser_args = argparse.ArgumentParser(description='Parse San Francisco Municipal Code HTML files')
     parser_args.add_argument('-i', '--input', default=CONFIG['input_file'], 
                             help=f"Input HTML file (default: {CONFIG['input_file']})")
-    parser_args.add_argument('-o', '--output', default=CONFIG['output_file'],
-                            help=f"Output JSON file (default: {CONFIG['output_file']})")
+    parser_args.add_argument('-o', '--output', required=True,
+                            help="Output JSON file (required)")
     parser_args.add_argument('-s', '--chunk-size', type=int, default=CONFIG['max_chunk_size'],
                             help=f"Maximum chunk size (default: {CONFIG['max_chunk_size']})")
     parser_args.add_argument('-b', '--browse', action='store_true',
